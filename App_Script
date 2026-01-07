@@ -1,0 +1,505 @@
+// ====================================================
+// CONFIG
+// ====================================================
+
+var FORECAST_DAYS = 7;
+
+// ====================================================
+// WEB RECEIVER (ESP32 SAFE)
+// ====================================================
+function doGet(e) {
+  return handleData(e);
+}
+function doPost(e) {
+  return handleData(e);
+}
+
+function handleData(e) {
+  try {
+    if (!e || !e.parameter) {
+      return ContentService.createTextOutput(
+        JSON.stringify({ status: "error", message: "No parameters received" })
+      );
+    }
+
+    const SPREADSHEET_ID = "https://docs.google.com/spreadsheets/d/11PEFMcuGI2wAqcQeKArZMuROalLRD_Hkjo2jTfo0CQM/edit?gid=0#gid=0";
+    var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    var sheet = ss.getSheetByName("Sheet1");
+
+    if (!sheet) {
+      sheet = ss.insertSheet("Sheet1");
+      sheet.appendRow(["Timestamp", "Temperature", "Humidity", "Pressure", "Distance"]);
+    }
+
+    sheet.appendRow([
+      new Date(),
+      Number(e.parameter.temperature),
+      Number(e.parameter.humidity),
+      Number(e.parameter.pressure),
+      Number(e.parameter.distance)
+    ]);
+
+    return ContentService.createTextOutput(
+      JSON.stringify({ status: "ok", message: "Data saved" })
+    );
+
+  } catch (err) {
+    return ContentService.createTextOutput(
+      JSON.stringify({ status: "error", message: err.toString() })
+    );
+  }
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Sensor Data")
+    .addItem("📈 Generate 24h Forecast", "generateForecasts")
+    .addItem("🧠 AI Analyze Latest Data", "analyzeLatestDataWithAI")
+    .addItem("📄 Generate AI Report", "generateAIReport")
+    .addSeparator()
+    .addItem("🗑 Clear All Sensor Data", "clearData")
+    .addToUi();
+}
+
+// ===================================
+// CLEAR SENSOR DATA
+// ===================================
+function clearData() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Sheet1");
+
+  if (!sheet) {
+    SpreadsheetApp.getUi().alert("❌ Sheet 'Sheet1' not found.");
+    return;
+  }
+
+  var lastRow = sheet.getLastRow();
+
+  if (lastRow <= 1) {
+    SpreadsheetApp.getUi().alert("ℹ No data to clear.");
+    return;
+  }
+
+  sheet.deleteRows(2, lastRow - 1);
+  SpreadsheetApp.getUi().alert("✅ All sensor data cleared!");
+}
+
+// ====================================================
+// DAILY AVERAGE CALCULATION
+// ====================================================
+function getDailyAverages() {
+  var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName("Sheet1");
+  var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 5).getValues();
+
+  var daily = {};
+
+  data.forEach(r => {
+    if (!r[0]) return;
+
+    var day = Utilities.formatDate(new Date(r[0]), Session.getScriptTimeZone(), "yyyy-MM-dd");
+
+    if (!daily[day]) {
+      daily[day] = { t: [], h: [], p: [], d: [] };
+    }
+
+    daily[day].t.push(r[1]);
+    daily[day].h.push(r[2]);
+    daily[day].p.push(r[3]);
+    daily[day].d.push(r[4]);
+  });
+
+  var result = [];
+
+  Object.keys(daily).sort().forEach(day => {
+    var o = daily[day];
+    result.push([
+      new Date(day),
+      avg(o.t),
+      avg(o.h),
+      avg(o.p),
+      avg(o.d)
+    ]);
+  });
+
+  return result.slice(-FORECAST_DAYS); // LAST 7 DAYS ONLY
+}
+
+function avg(arr) {
+  arr = arr.filter(v => !isNaN(v));
+  if (arr.length === 0) return NaN;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
+
+// ====================================================
+// LINEAR REGRESSION
+// ====================================================
+var FORECAST_HOURS = 24;
+
+// ================================
+// Linear Regression
+// ================================
+function linearRegression(series, h) {
+  var n = series.length;
+  var sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+
+  for (var i = 0; i < n; i++) {
+    sumX += i;
+    sumY += series[i];
+    sumXY += i * series[i];
+    sumX2 += i * i;
+  }
+
+  var denominator = (n * sumX2 - sumX * sumX);
+  if (denominator === 0) return [];
+
+  var m = (n * sumXY - sumX * sumY) / denominator;
+  var b = (sumY - m * sumX) / n;
+
+  var forecasts = [];
+  for (var k = 1; k <= h; k++) {
+    forecasts.push(m * (n + k) + b);
+  }
+  return forecasts;
+}
+
+// ================================
+// MAIN FORECAST FUNCTION
+// ================================
+function generateForecasts() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Sheet1");
+  var fSheet = ss.getSheetByName("Forecasts") || ss.insertSheet("Forecasts");
+
+  fSheet.clear();
+  fSheet.getRange(1, 1, 1, 13).setValues([[
+    "Timestamp",
+    "TempForecasts", "TempUpper", "TempLower",
+    "HumForecasts", "HumUpper", "HumLower",
+    "PresForecasts", "PresUpper", "PresLower",
+    "DistForecasts", "DistUpper", "DistLower"
+  ]]);
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("Not enough data.");
+    return;
+  }
+
+  var raw = sheet.getRange(2, 1, lastRow - 1, 5).getValues();
+
+  // ================================
+  // GROUP DATA BY DATE
+  // ================================
+  var daily = {};
+
+  raw.forEach(r => {
+    if (!r[0]) return;
+
+    var dateKey = Utilities.formatDate(new Date(r[0]), Session.getScriptTimeZone(), "yyyy-MM-dd");
+
+    if (!daily[dateKey]) {
+      daily[dateKey] = { t: [], h: [], p: [], d: [] };
+    }
+
+    if (!isNaN(r[1])) daily[dateKey].t.push(r[1]);
+    if (!isNaN(r[2])) daily[dateKey].h.push(r[2]);
+    if (!isNaN(r[3])) daily[dateKey].p.push(r[3]);
+    if (!isNaN(r[4])) daily[dateKey].d.push(r[4]);
+  });
+
+  // ================================
+  // CALCULATE DAILY AVERAGES
+  // ================================
+  var days = Object.keys(daily).sort().slice(-7);
+
+  if (days.length < 2) {
+    SpreadsheetApp.getUi().alert("Need at least 2 days of data.");
+    return;
+  }
+
+  var avgT = [], avgH = [], avgP = [], avgD = [];
+
+  days.forEach(day => {
+    var v = daily[day];
+    avgT.push(average(v.t));
+    avgH.push(average(v.h));
+    avgP.push(average(v.p));
+    avgD.push(average(v.d));
+  });
+
+  // ================================
+  // FORECAST NEXT 24 HOURS
+  // ================================
+  var fT = linearRegression(avgT, FORECAST_HOURS);
+  var fH = linearRegression(avgH, FORECAST_HOURS);
+  var fP = linearRegression(avgP, FORECAST_HOURS);
+  var fD = linearRegression(avgD, FORECAST_HOURS);
+
+  var lastTimestamp = new Date(raw[raw.length - 1][0]);
+
+  for (var i = 0; i < FORECAST_HOURS; i++) {
+    var ts = new Date(lastTimestamp.getTime() + (i + 1) * 3600000);
+
+    fSheet.appendRow([
+      ts,
+      fT[i], fT[i] * 1.05, fT[i] * 0.95,
+      fH[i], fH[i] * 1.05, fH[i] * 0.95,
+      fP[i], fP[i] * 1.05, fP[i] * 0.95,
+      fD[i], fD[i] * 1.05, fD[i] * 0.95
+    ]);
+  }
+
+  SpreadsheetApp.getUi().alert("✅ 24-hour forecast generated using last 7 days (daily averages)");
+}
+
+// ================================
+// SEND DATA TO GEMINI
+// ================================
+// ===Gemini API Integration===
+function getGeminiApiKey() {
+  return PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+}
+
+function callGemini(prompt) {
+  var apiKey = getGeminiApiKey();
+
+  if (!apiKey) {
+    return "❌ Gemini API key not found in Script Properties.";
+  }
+
+  // ===API Request Construction===
+  var url = "https://generativelanguage.googleapis.com/v1/models/gemini-2.5-flash:generateContent?key=" + apiKey;
+
+  // ===Payload Structure===
+  var payload = {
+    contents: [{
+      parts: [{ text: prompt }]
+    }]
+  };
+
+  var options = {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url, options);
+  var text = response.getContentText();
+
+  // ===Response Handling===
+  try {
+    var json = JSON.parse(text);
+    if (!json.candidates || !json.candidates.length) {
+      return "Gemini Error: " + text;
+    }
+    return json.candidates[0].content.parts[0].text;
+  } catch (e) {
+    return "Parsing Error: " + text;
+  }
+}
+
+
+// ================================
+// AI-Analysis
+// ================================
+// ===Real-Time AI Analysis===
+function analyzeLatestDataWithAI() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Sheet1");
+
+  if (!sheet || sheet.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert("No sensor data available.");
+    return;
+  }
+
+  // ============================
+  // 1. Latest real-time data
+  // ============================
+  // ===Extract Latest Sensor Reading===
+  var last = sheet.getRange(sheet.getLastRow(), 1, 1, 5).getValues()[0];
+  var temperature = last[1];
+  var humidity = last[2];
+  var pressure = last[3];
+  var distance = last[4];
+
+  // ============================
+  // 2. Real-time insight prompts (per parameter)
+  // ============================
+  // ===Parameter-Specific AI Prompts===
+  var tempPrompt = `Analyze the real-time temperature reading (${temperature}°C). 
+Provide a concise technical summary focusing on normality, anomalies, and operational implications. 
+Limit to 80 words.`;
+
+  var humPrompt = `Analyze the real-time humidity reading (${humidity}%). 
+Provide a concise technical summary focusing on stability, anomalies, and environmental impact. 
+Limit to 80 words.`;
+
+  var presPrompt = `Analyze the real-time pressure reading (${pressure}). 
+Provide a concise technical summary focusing on deviations, sensor reliability, and atmospheric implications. 
+Limit to 80 words.`;
+
+  var distPrompt = `Analyze the real-time distance reading (${distance} cm). 
+Provide a concise technical summary focusing on object detection reliability, anomalies, and system implications. 
+Limit to 80 words.`;
+
+  var tempInsight = callGemini(tempPrompt);
+  var humInsight  = callGemini(humPrompt);
+  var presInsight = callGemini(presPrompt);
+  var distInsight = callGemini(distPrompt);
+
+  // ============================
+  // 3. Historical trends (daily averages)
+  // ============================
+  // ===Historical Trend Context===
+  var trends = getDailyAverages()
+    .map(r =>
+      `Date ${r[0]} → Temp ${r[1].toFixed(2)}°C, Hum ${r[2].toFixed(2)}%, Pres ${r[3].toFixed(2)}, Dist ${r[4].toFixed(2)}`
+    )
+    .join("\n");
+
+  // ============================
+  // 4. Forecast data
+  // ============================
+  // ===Forecast Interpretation===
+  var forecast = "No forecast data available.";
+  var fSheet = ss.getSheetByName("Forecasts");
+
+  if (fSheet && fSheet.getLastRow() > 1) {
+    forecast = fSheet
+      .getRange(2, 1, fSheet.getLastRow() - 1, 5)
+      .getValues()
+      .map(r => `Time ${r[0]} → Temp ${r[1].toFixed(2)}°C`)
+      .join("\n");
+  }
+
+  // ============================
+  // 5. Unified trend + forecast prompt
+  // ============================
+  // ===Unified Analysis Prompt===
+  var analysisPrompt = `
+You are analyzing IoT environmental sensor data.
+
+Formatting rules (STRICT – MUST FOLLOW):
+- Headings must be bold text only
+- Bold text is ONLY allowed for headings
+- Do NOT use numbered lists
+- Use the bullet symbol ‣ for all points
+- Do NOT use markdown formatting other than bold headings
+- Do NOT use italics
+- Keep the tone professional and technical
+
+Output structure (use EXACT headings):
+
+### Historical Trends
+${trends}
+
+### Latest Real-Time Reading
+Temperature: ${temperature} °C
+Humidity: ${humidity} %
+Pressure: ${pressure}
+Distance: ${distance} cm
+
+### Forecasted Data
+${forecast}
+
+### Tasks:
+• Identify trends
+• Detect anomalies
+• Compare real-time vs historical
+• Interpret forecast risks
+• Provide technical insights
+`;
+
+  var fullAnalysis = callGemini(analysisPrompt);
+
+  // ============================
+  // 6. Save all outputs
+  // ============================
+  var aSheet = ss.getSheetByName("AI_Analysis") || ss.insertSheet("AI_Analysis");
+
+  aSheet.appendRow([
+    new Date(),
+    tempInsight,
+    humInsight,
+    presInsight,
+    distInsight,
+    fullAnalysis
+  ]);
+
+  SpreadsheetApp.getUi().alert("✅ Real-time summaries and full AI analysis generated.");
+}
+
+// ================================
+// AI Report Generation (Daily / Weekly)
+// ================================
+function generateAIReport() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Sheet1");
+
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("No data available.");
+    return;
+  }
+
+  var now = new Date();
+  var formattedNow = Utilities.formatDate(
+    now,
+    Session.getScriptTimeZone(),
+    "yyyy-MM-dd HH:mm:ss"
+  );
+
+  // Get last 50 rows max
+  var rows = Math.min(50, lastRow - 1);
+  var data = sheet.getRange(lastRow - rows + 1, 1, rows, 5).getValues();
+
+  var dataText = data.map(r =>
+    `Time: ${r[0]}, Temp: ${r[1]}°C, Humidity: ${r[2]}%, Pressure: ${r[3]} bar, Distance: ${r[4]} cm`
+  ).join("\n");
+
+  var prompt = `
+You are an IoT sensor data analysis system.
+
+IMPORTANT RULES:
+- Use ONLY the data provided
+- Do NOT invent dates
+- Headings must be bold text only
+- Bold text is ONLY allowed for headings
+- Do NOT use bold text anywhere else
+- Do NOT use numbered lists
+- Use the bullet symbol ‣ for all points
+- Do NOT use markdown formatting other than bold headings
+- Do NOT use italics
+- Keep the tone professional and technical
+- Do NOT mention air quality, PM2.5, CO2, or noise
+- Use the report timestamp exactly as given
+
+Report Timestamp: ${formattedNow}
+Data Period: Last ${rows} sensor readings
+
+Sensor Data:
+${dataText}
+
+Tasks:
+1. Analyze trends (increasing, decreasing, stable)
+2. Identify anomalies
+3. Highlight risks or warnings
+4. Provide a concise technical summary
+`;
+
+  var report = callGemini(prompt);
+
+  var rSheet = ss.getSheetByName("AI_Reports") || ss.insertSheet("AI_Reports");
+  rSheet.appendRow([now, report]);
+
+  SpreadsheetApp.getUi().alert("✅ AI report generated.");
+}
+
+// ================================
+// HELPER FUNCTION
+// ================================
+function average(arr) {
+  if (!arr.length) return NaN;
+  return arr.reduce((a, b) => a + b, 0) / arr.length;
+}
