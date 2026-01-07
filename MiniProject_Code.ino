@@ -1,31 +1,58 @@
+/************************************************************
+ * ESP32 Environmental Monitoring System
+ * Sensors:
+ *  - BME280 (Temperature, Humidity, Pressure)
+ *  - Ultrasonic Sensor (Distance)
+ * Features:
+ *  - WiFi connectivity
+ *  - Data buffering & averaging
+ *  - Google Apps Script data upload
+ *  - Watchdog timer protection
+ *  - System diagnostics output
+ ************************************************************/
+
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BME280.h>
 #include "esp_task_wdt.h"
 
-// ================== WIFI CONFIG ===================
+/* ================== WIFI CONFIG ==================
+ * WiFi credentials for ESP32 connection
+ */
 const char* ssid = "Unifi@5GHz";
 const char* password = "Ansontay7";
 
+/* Google Apps Script Web App URL
+ * Used to send sensor data to Google Sheets
+ */
 String GOOGLE_SCRIPT_URL =
 "https://script.google.com/macros/s/AKfycbyrg3smCTpl7qGHyqbH3ZJZ7lNGvEeUkIrYfzZKPb4sD-oi5LXJfoLE0t2SswhLaoaaIg/exec";
 
-// ================== HARDWARE ======================
+/* ================== HARDWARE SETUP ==================
+ * Pin definitions
+ */
 #define TRIG_PIN 5
 #define ECHO_PIN 18
 #define STATUS_LED 2
 
+/* BME280 sensor object (I2C) */
 Adafruit_BME280 bme;
 
-// ================== SAMPLING ======================
+/* ================== SAMPLING CONFIG ==================
+ * Data sampled every 1 minute
+ * 5 samples are averaged before transmission
+ */
 const unsigned long SAMPLE_INTERVAL = 60000; // 1 minute
 unsigned long lastSample = 0;
 
+/* Buffers to store 5 samples */
 float tempBuf[5], humBuf[5], presBuf[5], distBuf[5];
 int sampleCount = 0;
 
-// ================== DATA STRUCT ===================
+/* ================== SENSOR DATA STRUCT ==================
+ * Structure to hold sensor values and validity flag
+ */
 struct SensorData {
   float temperature;
   float humidity;
@@ -34,24 +61,33 @@ struct SensorData {
   bool valid;
 };
 
-// ==================================================
-
+/* =======================================================
+ * SETUP FUNCTION
+ * Runs once when ESP32 starts
+ * =======================================================
+ */
 void setup() {
   Serial.begin(115200);
+
+  // Configure GPIO pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
   pinMode(STATUS_LED, OUTPUT);
 
   digitalWrite(STATUS_LED, LOW);
 
+  // Initialize BME280 sensor
   if (!bme.begin(0x76)) {
     Serial.println("BME280 not detected!");
     while (1);
   }
 
+  // Connect to WiFi
   connectWiFi();
 
-  // Watchdog: reset if system freezes >10s
+  /* Watchdog Timer Configuration
+   * Automatically resets ESP32 if program freezes > 10s
+   */
   esp_task_wdt_config_t wdt_config = {
   .timeout_ms = 10000,   // 10 seconds
   .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
@@ -62,7 +98,10 @@ esp_task_wdt_init(&wdt_config);
 esp_task_wdt_add(NULL);
 }
 
-// ================= WIFI ===========================
+/* =======================================================
+ * WIFI CONNECTION FUNCTION
+ * =======================================================
+ */
 void connectWiFi() {
   WiFi.begin(ssid, password);
   Serial.print("Connecting WiFi");
@@ -82,7 +121,11 @@ void connectWiFi() {
   }
 }
 
-// ================= SENSOR READ ====================
+/* =======================================================
+ * ULTRASONIC SENSOR FUNCTION
+ * Returns distance in centimeters
+ * =======================================================
+ */
 float readUltrasonicCM() {
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
@@ -96,10 +139,20 @@ float readUltrasonicCM() {
   return duration * 0.034 / 2;
 }
 
+/* =======================================================
+ * SENSOR VALIDATION FUNCTION
+ * Ensures readings are within acceptable range
+ * =======================================================
+ */
 bool checkValid(float v, float minV, float maxV) {
   return !(isnan(v) || v < minV || v > maxV);
 }
 
+/* =======================================================
+ * READ ALL SENSORS FUNCTION
+ * Reads and validates all sensor values
+ * =======================================================
+ */
 SensorData readAllSensors() {
   SensorData data;
 
@@ -118,7 +171,11 @@ SensorData readAllSensors() {
   return data;
 }
 
-// ================= DIAGNOSTICS ====================
+/* =======================================================
+ * SYSTEM DIAGNOSTICS FUNCTION
+ * Prints system health information
+ * =======================================================
+ */
 void printSystemStatus() {
   Serial.println("----- SYSTEM STATUS -----");
   Serial.print("Free Heap: ");
@@ -128,7 +185,11 @@ void printSystemStatus() {
   Serial.println("-------------------------");
 }
 
-// ================= DATA SEND ======================
+/* =======================================================
+ * SEND DATA TO GOOGLE SHEETS
+ * Uses HTTP GET request
+ * =======================================================
+ */
 void sendToGoogle(float t, float h, float p, float d) {
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
@@ -154,16 +215,24 @@ void sendToGoogle(float t, float h, float p, float d) {
   digitalWrite(STATUS_LED, HIGH);
 }
 
-// ================= MAIN LOOP ======================
+/* =======================================================
+ * MAIN LOOP
+ * Runs continuously
+ * =======================================================
+ */
 void loop() {
+  // Reset watchdog timer
   esp_task_wdt_reset();
 
+  // Sample every 1 minute
   if (millis() - lastSample < SAMPLE_INTERVAL) return;
   lastSample = millis();
-
+  
+  // Read sensors
   SensorData data = readAllSensors();
   if (!data.valid) return;
 
+  // Store readings in buffer
   tempBuf[sampleCount] = data.temperature;
   humBuf[sampleCount]  = data.humidity;
   presBuf[sampleCount] = data.pressure;
@@ -172,6 +241,7 @@ void loop() {
 
   Serial.printf("Buffered Sample %d/5\n", sampleCount);
 
+  // After 5 samples, calculate average and send
   if (sampleCount >= 5) {
     float avgT = 0, avgH = 0, avgP = 0, avgD = 0;
 
